@@ -18,7 +18,6 @@ import com.winlator.cmod.xserver.XServer;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.hardware.input.InputManager;
-import android.os.Handler;
 import android.net.LocalServerSocket;
 import android.net.LocalSocket;
 import android.os.VibrationEffect;
@@ -105,10 +104,14 @@ public class WinHandler {
 
         preferences = PreferenceManager.getDefaultSharedPreferences(activity.getBaseContext());
 
-        // Load per-slot vibration preferences (default: enabled)
+        // Force-enable vibration for all slots on startup.
+        // This avoids stale saved preferences disabling rumble unexpectedly.
+        SharedPreferences.Editor editor = preferences.edit();
         for (int i = 0; i < MAX_CONTROLLERS; i++) {
-            vibrationEnabledSlots[i] = preferences.getBoolean("vibration_slot_" + i, true);
+            vibrationEnabledSlots[i] = true;
+            editor.putBoolean("vibration_slot_" + i, true);
         }
+        editor.apply();
     }
 
     private boolean sendPacket(int port) {
@@ -356,33 +359,12 @@ public class WinHandler {
         });
     }
 
+    /** Wine rumble is always mapped to the phone vibrator (never gamepad motors). */
     private void triggerVibration(int strong, int weak, int durationMs, int slot) {
-        // Check if vibration is enabled for this slot
         if (slot >= 0 && slot < MAX_CONTROLLERS && !vibrationEnabledSlots[slot])
             return;
 
-        Vibrator vibrator = null;
-
-        // Find which deviceId owns this slot
-        Integer deviceId = null;
-        for (Map.Entry<Integer, Integer> entry : deviceToSlot.entrySet()) {
-            if (entry.getValue() == slot) {
-                deviceId = entry.getKey();
-                break;
-            }
-        }
-
-        if (deviceId != null && deviceId == OSC_DEVICE_ID) {
-            // OSC is mapped to this slot — use the phone vibrator
-            vibrator = (Vibrator) activity.getSystemService(Context.VIBRATOR_SERVICE);
-        } else if (deviceId != null) {
-            // Physical controller — use its own vibrator
-            android.view.InputDevice device = android.view.InputDevice.getDevice(deviceId);
-            if (device != null) {
-                vibrator = device.getVibrator();
-            }
-        }
-
+        Vibrator vibrator = (Vibrator) activity.getSystemService(Context.VIBRATOR_SERVICE);
         if (vibrator == null || !vibrator.hasVibrator())
             return;
 
@@ -571,7 +553,15 @@ public class WinHandler {
         if (existing != null)
             return existing;
 
-        for (int slot = 0; slot < MAX_CONTROLLERS; slot++) {
+        // Prefer slot 0 for physical controllers so games that rumble player 1
+        // target the physical pad instead of OSC.
+        int startSlot = 0;
+        if (deviceId == OSC_DEVICE_ID) {
+            // If any physical controller is already assigned, keep OSC away from slot 0.
+            startSlot = hasAnyPhysicalAssigned() ? 1 : 0;
+        }
+
+        for (int slot = startSlot; slot < MAX_CONTROLLERS; slot++) {
             if (!usedSlots.contains(slot)) {
                 usedSlots.add(slot);
                 deviceToSlot.put(deviceId, slot);
@@ -585,6 +575,15 @@ public class WinHandler {
         }
         Log.w("WinHandler", "No slots available for device " + deviceId);
         return -1;
+    }
+
+    private boolean hasAnyPhysicalAssigned() {
+        for (Integer mappedDeviceId : deviceToSlot.keySet()) {
+            if (mappedDeviceId != null && mappedDeviceId != OSC_DEVICE_ID) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void releaseSlot(int deviceId) {

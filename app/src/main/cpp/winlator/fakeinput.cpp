@@ -7,6 +7,7 @@
 #include <fstream>
 #include <algorithm>
 #include <mutex>
+#include <thread>
 
 #include <fcntl.h>
 #include <dirent.h>
@@ -84,29 +85,33 @@ void send_vibration(int strong, int weak, uint16_t duration_ms, uint16_t slot) {
   if (!vibration_enabled)
     return;
 
-  int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (sock < 0)
-    return;
+  // Must not block Wine's evdev write/ioctl thread: connect() waits for Java accept()
+  // and would freeze gamepad input for the whole rumble handshake.
+  std::thread([strong, weak, duration_ms, slot]() {
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0)
+      return;
 
-  struct sockaddr_un addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sun_family = AF_UNIX;
-  const char *name = "winlator_vibration";
-  memcpy(addr.sun_path + 1, name, strlen(name));
-  socklen_t addrlen = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(name);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    const char *name = "winlator_vibration";
+    memcpy(addr.sun_path + 1, name, strlen(name));
+    socklen_t addrlen = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(name);
 
-  if (connect(sock, (struct sockaddr *)&addr, addrlen) < 0) {
+    if (connect(sock, (struct sockaddr *)&addr, addrlen) < 0) {
+      syscall(SYS_close, sock);
+      return;
+    }
+
+    uint16_t data[4];
+    data[0] = (uint16_t)strong;
+    data[1] = (uint16_t)weak;
+    data[2] = duration_ms;
+    data[3] = slot;
+    send(sock, data, sizeof(data), 0);
     syscall(SYS_close, sock);
-    return;
-  }
-
-  uint16_t data[4];
-  data[0] = (uint16_t)strong;
-  data[1] = (uint16_t)weak;
-  data[2] = duration_ms;
-  data[3] = slot;
-  send(sock, data, sizeof(data), 0);
-  syscall(SYS_close, sock);
+  }).detach();
 }
 
 __attribute__((constructor))
