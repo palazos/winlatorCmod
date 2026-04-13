@@ -55,6 +55,7 @@ import java.util.List;
 import java.util.Locale;
 
 public class ShortcutSettingsDialog extends ContentDialog {
+    private static final String PREF_SHOW_TOUCHSCREEN_CONTROLS = "show_touchscreen_controls_enabled";
     private final ShortcutsFragment fragment;
     private final Shortcut shortcut;
     private InputControlsManager inputControlsManager;
@@ -81,6 +82,13 @@ public class ShortcutSettingsDialog extends ContentDialog {
 //        }
 
         createContentView();
+    }
+
+    private String getContainerScopedKey(int containerId, String baseKey) {
+        if (containerId > 0) {
+            return "container_" + containerId + "_" + baseKey;
+        }
+        return baseKey;
     }
 
     private void createContentView() {
@@ -452,6 +460,11 @@ public class ShortcutSettingsDialog extends ContentDialog {
                 ArrayList<ControlsProfile> profiles = inputControlsManager.getProfiles(true);
                 int controlsProfile = sControlsProfile.getSelectedItemPosition() > 0 ? profiles.get(sControlsProfile.getSelectedItemPosition() - 1).id : 0;
                 shortcut.putExtra("controlsProfile", controlsProfile > 0 ? String.valueOf(controlsProfile) : null);
+                String showKey = getContainerScopedKey(shortcut.container.id, PREF_SHOW_TOUCHSCREEN_CONTROLS);
+                boolean showTouchscreenControls = prefs.contains(showKey)
+                        ? prefs.getBoolean(showKey, true)
+                        : prefs.getBoolean(PREF_SHOW_TOUCHSCREEN_CONTROLS, true);
+                shortcut.putExtra("showTouchscreenControls", showTouchscreenControls ? "1" : "0");
 
                 String cpuList = cpuListView.getCheckedCPUListAsString();
                 shortcut.putExtra("cpuList", cpuList);

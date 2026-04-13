@@ -70,9 +70,12 @@ public class WinHandler {
     // Multi-controller support
     private static final int MAX_CONTROLLERS = 4;
     private static final int OSC_DEVICE_ID = -1;
+    private static final String PREF_OSC_SLOT = "osc_reserved_slot";
+    private static final String PREF_OSC_LAST_ENABLED = "osc_last_enabled";
     private FakeInputWriter[] writers = new FakeInputWriter[MAX_CONTROLLERS];
     private Map<Integer, Integer> deviceToSlot = new HashMap<>();
     private Set<Integer> usedSlots = new HashSet<>();
+    private final ControllerSlotCoordinator slotCoordinator = new ControllerSlotCoordinator();
     private String fakeInputBasePath;
     private LocalServerSocket vibrationServer;
     private volatile boolean vibrationRunning = false;
@@ -82,6 +85,9 @@ public class WinHandler {
     private boolean xinputDisabledInitialized = false;
 
     private int fallbackSlot = -1;
+    private int preferredOscSlot = -1;
+    private boolean oscWasEnabledLastSession = false;
+    private int persistenceContainerId = -1;
 
     private final InputManager inputManager;
     private final InputManager.InputDeviceListener inputDeviceListener;
@@ -111,6 +117,7 @@ public class WinHandler {
         for (int i = 0; i < MAX_CONTROLLERS; i++) {
             vibrationEnabledSlots[i] = preferences.getBoolean("vibration_slot_" + i, true);
         }
+        loadOscPersistenceState();
     }
 
     private boolean sendPacket(int port) {
@@ -574,6 +581,33 @@ public class WinHandler {
     }
 
     /**
+     * Pre-detect currently connected controllers and reserve slots before container
+     * startup.
+     */
+    public synchronized void prepareControllerSlotsForStartup(int requestedSlots) {
+        int maxSlots = Math.max(1, Math.min(requestedSlots, MAX_CONTROLLERS));
+        for (android.view.InputDevice device : slotCoordinator.getConnectedControllersSorted()) {
+            if (usedSlots.size() >= maxSlots) {
+                break;
+            }
+            int reservedSlot = slotCoordinator.reservePreferredSlot(device.getId(), maxSlots, usedSlots, deviceToSlot);
+            if (reservedSlot >= 0) {
+                openWriterIfNeeded(reservedSlot);
+            }
+        }
+
+        // Reserve OSC slot early so Wine sees a stable eventN mapping at startup.
+        if (oscWasEnabledLastSession && preferredOscSlot >= 0 && preferredOscSlot < MAX_CONTROLLERS
+                && !usedSlots.contains(preferredOscSlot)) {
+            usedSlots.add(preferredOscSlot);
+            deviceToSlot.put(OSC_DEVICE_ID, preferredOscSlot);
+            openWriterIfNeeded(preferredOscSlot);
+            Log.d("WinHandler", "Pre-reserved OSC slot " + preferredOscSlot + " for startup");
+        }
+        Log.d("WinHandler", "Pre-assigned controller slots for startup: " + deviceToSlot);
+    }
+
+    /**
      * Assign a slot to a device using FCFS. Sticky slots - disconnect keeps
      * reservation.
      */
@@ -582,15 +616,23 @@ public class WinHandler {
         if (existing != null)
             return existing;
 
+        if (deviceId == OSC_DEVICE_ID) {
+            return assignOscSlot();
+        }
+
+        int preferredSlot = slotCoordinator.reservePreferredSlot(deviceId, MAX_CONTROLLERS, usedSlots, deviceToSlot);
+        if (preferredSlot >= 0) {
+            openWriterIfNeeded(preferredSlot);
+            return preferredSlot;
+        }
+
         for (int slot = 0; slot < MAX_CONTROLLERS; slot++) {
             if (!usedSlots.contains(slot)) {
                 usedSlots.add(slot);
                 deviceToSlot.put(deviceId, slot);
-                if (fakeInputBasePath != null && writers[slot] == null) {
-                    writers[slot] = new FakeInputWriter(fakeInputBasePath, slot);
-                    writers[slot].open();
-                    Log.d("WinHandler", "Assigned device " + deviceId + " to slot " + slot);
-                }
+                slotCoordinator.rememberAssignedSlot(deviceId, slot);
+                openWriterIfNeeded(slot);
+                Log.d("WinHandler", "Assigned device " + deviceId + " to slot " + slot);
                 return slot;
             }
         }
@@ -598,9 +640,49 @@ public class WinHandler {
         return -1;
     }
 
+    private int assignOscSlot() {
+        if (preferredOscSlot >= 0 && preferredOscSlot < MAX_CONTROLLERS && !usedSlots.contains(preferredOscSlot)) {
+            usedSlots.add(preferredOscSlot);
+            deviceToSlot.put(OSC_DEVICE_ID, preferredOscSlot);
+            openWriterIfNeeded(preferredOscSlot);
+            oscWasEnabledLastSession = true;
+            saveOscPersistenceState();
+            Log.d("WinHandler", "Restored OSC slot " + preferredOscSlot);
+            return preferredOscSlot;
+        }
+
+        for (int slot = 0; slot < MAX_CONTROLLERS; slot++) {
+            if (!usedSlots.contains(slot)) {
+                usedSlots.add(slot);
+                deviceToSlot.put(OSC_DEVICE_ID, slot);
+                openWriterIfNeeded(slot);
+                if (preferredOscSlot != slot) {
+                    preferredOscSlot = slot;
+                }
+                oscWasEnabledLastSession = true;
+                saveOscPersistenceState();
+                Log.d("WinHandler", "Assigned OSC to slot " + slot);
+                return slot;
+            }
+        }
+        Log.w("WinHandler", "No slots available for OSC");
+        return -1;
+    }
+
+    private void openWriterIfNeeded(int slot) {
+        if (fakeInputBasePath != null && writers[slot] == null) {
+            writers[slot] = new FakeInputWriter(fakeInputBasePath, slot);
+            writers[slot].open();
+        }
+    }
+
     private void releaseSlot(int deviceId) {
         Integer slot = deviceToSlot.remove(deviceId);
         if (slot != null) {
+            if (deviceId == OSC_DEVICE_ID) {
+                oscWasEnabledLastSession = false;
+                saveOscPersistenceState();
+            }
             if (fallbackSlot == slot) fallbackSlot = -1;
             if (writers[slot] != null) {
                 // Use softRelease instead of destroy to keep the event file
@@ -618,6 +700,48 @@ public class WinHandler {
         this.xinputDisabled = disabled;
         this.xinputDisabledInitialized = true;
         Log.d("WinHandler", "XInput Disabled set to: " + xinputDisabled);
+    }
+
+    /**
+     * Sets container-specific scope for persisted OSC state.
+     */
+    public synchronized void setPersistenceContainerId(int containerId) {
+        this.persistenceContainerId = containerId;
+        loadOscPersistenceState();
+    }
+
+    private String buildContainerScopedKey(String baseKey) {
+        if (persistenceContainerId > 0) {
+            return "container_" + persistenceContainerId + "_" + baseKey;
+        }
+        return baseKey;
+    }
+
+    private void loadOscPersistenceState() {
+        String slotKey = buildContainerScopedKey(PREF_OSC_SLOT);
+        String enabledKey = buildContainerScopedKey(PREF_OSC_LAST_ENABLED);
+
+        // Backward compatibility with legacy global keys.
+        if (preferences.contains(slotKey)) {
+            preferredOscSlot = preferences.getInt(slotKey, -1);
+        } else {
+            preferredOscSlot = preferences.getInt(PREF_OSC_SLOT, -1);
+        }
+
+        if (preferences.contains(enabledKey)) {
+            oscWasEnabledLastSession = preferences.getBoolean(enabledKey, false);
+        } else {
+            oscWasEnabledLastSession = preferences.getBoolean(PREF_OSC_LAST_ENABLED, false);
+        }
+    }
+
+    private void saveOscPersistenceState() {
+        String slotKey = buildContainerScopedKey(PREF_OSC_SLOT);
+        String enabledKey = buildContainerScopedKey(PREF_OSC_LAST_ENABLED);
+        preferences.edit()
+                .putInt(slotKey, preferredOscSlot)
+                .putBoolean(enabledKey, oscWasEnabledLastSession)
+                .apply();
     }
 
     /**
@@ -644,6 +768,7 @@ public class WinHandler {
         }
         deviceToSlot.clear();
         usedSlots.clear();
+        slotCoordinator.clear();
         controllers.clear();
         fallbackSlot = -1;
 

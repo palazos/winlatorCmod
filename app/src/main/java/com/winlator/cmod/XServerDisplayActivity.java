@@ -192,6 +192,10 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
     private Handler handler;
     private Runnable savePlaytimeRunnable;
     private static final long SAVE_INTERVAL_MS = 1000;
+    private static final String PREF_OSC_SLOT = "osc_reserved_slot";
+    private static final String PREF_OSC_LAST_ENABLED = "osc_last_enabled";
+    private static final String PREF_SHOW_TOUCHSCREEN_CONTROLS = "show_touchscreen_controls_enabled";
+    private static final String PREF_SELECTED_PROFILE_ID = "selected_profile_id";
 
     private Handler  timeoutHandler = new Handler(Looper.getMainLooper());
     private Runnable hideControlsRunnable;
@@ -202,6 +206,39 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
 
     private GuestProgramLauncherComponent guestProgramLauncherComponent;
     private EnvVars overrideEnvVars;
+    private int requestedControllerSlots = 1;
+    private int activeContainerId = -1;
+
+    private String getContainerScopedKey(String baseKey) {
+        if (activeContainerId > 0) {
+            return "container_" + activeContainerId + "_" + baseKey;
+        }
+        return baseKey;
+    }
+
+    private boolean getScopedBoolean(String key, boolean defaultValue) {
+        String scopedKey = getContainerScopedKey(key);
+        if (preferences.contains(scopedKey)) {
+            return preferences.getBoolean(scopedKey, defaultValue);
+        }
+        return preferences.getBoolean(key, defaultValue);
+    }
+
+    private int getScopedInt(String key, int defaultValue) {
+        String scopedKey = getContainerScopedKey(key);
+        if (preferences.contains(scopedKey)) {
+            return preferences.getInt(scopedKey, defaultValue);
+        }
+        return preferences.getInt(key, defaultValue);
+    }
+
+    private void putScopedBoolean(String key, boolean value) {
+        preferences.edit().putBoolean(getContainerScopedKey(key), value).apply();
+    }
+
+    private void putScopedInt(String key, int value) {
+        preferences.edit().putInt(getContainerScopedKey(key), value).apply();
+    }
 
     private void createNotifcationChannel() {
         String name = "Winlator";
@@ -401,6 +438,8 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
         }
 
         containerManager.activateContainer(container);
+        activeContainerId = containerId;
+        winHandler.setPersistenceContainerId(containerId);
 
         if (shortcutPath != null && !shortcutPath.isEmpty()) {
             shortcut = new Shortcut(container, new File(shortcutPath));
@@ -413,10 +452,23 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
             catch (NumberFormatException e) { numControllers = 1; }
         }
         numControllers = Math.max(1, Math.min(numControllers, 4));
-        for (int i = 0; i < numControllers; i++) {
+        requestedControllerSlots = numControllers;
+        String oscSlotKey = getContainerScopedKey(PREF_OSC_SLOT);
+        String oscEnabledKey = getContainerScopedKey(PREF_OSC_LAST_ENABLED);
+        int oscReservedSlot = preferences.contains(oscSlotKey)
+                ? preferences.getInt(oscSlotKey, -1)
+                : preferences.getInt(PREF_OSC_SLOT, -1);
+        boolean oscLastEnabled = preferences.contains(oscEnabledKey)
+                ? preferences.getBoolean(oscEnabledKey, false)
+                : preferences.getBoolean(PREF_OSC_LAST_ENABLED, false);
+        int filesToCreate = numControllers;
+        if (oscLastEnabled && oscReservedSlot >= 0 && oscReservedSlot < 4) {
+            filesToCreate = Math.max(filesToCreate, oscReservedSlot + 1);
+        }
+        for (int i = 0; i < filesToCreate; i++) {
             try { new File(devInputDir, "event" + i).createNewFile(); } catch (Exception e) {}
         }
-        Log.d("XServerDisplayActivity", "Pre-created " + numControllers + " controller event file(s)");
+        Log.d("XServerDisplayActivity", "Pre-created " + filesToCreate + " controller event file(s)");
 
         taskAffinityMask = (short) ProcessHelper.getAffinityMask(container.getCPUList(true));
         taskAffinityMaskWoW64 = (short) ProcessHelper.getAffinityMask(container.getCPUListWoW64(true));
@@ -1173,6 +1225,9 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
              // Cleanup moved to onCreate
         }
 
+        // Pre-detect controllers and reserve slots before guest startup.
+        winHandler.prepareControllerSlotsForStartup(requestedControllerSlots);
+
         // Start all environment components (XServer, Audio, Wine, etc.)
         environment.startEnvironmentComponents();
 
@@ -1268,6 +1323,14 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
 
         if (shortcut != null) {
             String controlsProfile = shortcut.getExtra("controlsProfile");
+            String shortcutShowTouchscreenControls = shortcut.getExtra("showTouchscreenControls");
+            if (!shortcutShowTouchscreenControls.isEmpty()) {
+                boolean showFromShortcut = parseBoolean(shortcutShowTouchscreenControls);
+                inputControlsView.setShowTouchscreenControls(showFromShortcut);
+                putScopedBoolean(PREF_SHOW_TOUCHSCREEN_CONTROLS, showFromShortcut);
+            } else {
+                inputControlsView.setShowTouchscreenControls(getScopedBoolean(PREF_SHOW_TOUCHSCREEN_CONTROLS, true));
+            }
             if (!controlsProfile.isEmpty()) {
                 ControlsProfile profile = inputControlsManager.getProfile(Integer.parseInt(controlsProfile));
                 if (profile != null) showInputControls(profile);
@@ -1394,6 +1457,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
             editor.putBoolean("touchscreen_timeout_enabled", isTimeoutEnabled);
             editor.putBoolean("touchscreen_haptics_enabled", isHapticsEnabled);
             editor.apply();
+            putScopedBoolean(PREF_SHOW_TOUCHSCREEN_CONTROLS, cbShowTouchscreenControls.isChecked());
 
             if (isTimeoutEnabled) {
                 startTouchscreenTimeout(); // Start the timeout functionality if enabled
@@ -1402,9 +1466,14 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
             }
             int position = sProfile.getSelectedItemPosition();
             if (position > 0) {
-                showInputControls(inputControlsManager.getProfiles().get(position - 1));
+                ControlsProfile selectedProfile = inputControlsManager.getProfiles().get(position - 1);
+                putScopedInt(PREF_SELECTED_PROFILE_ID, selectedProfile.id);
+                showInputControls(selectedProfile);
             }
-            else hideInputControls();
+            else {
+                putScopedInt(PREF_SELECTED_PROFILE_ID, 0);
+                hideInputControls();
+            }
             updateProfile.run();
         });
 
@@ -1415,10 +1484,15 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
     }
 
     private void simulateConfirmInputControlsDialog() {
-        // Simulate setting the relative mouse movement and touchscreen controls from preferences
-
-        boolean isShowTouchscreenControls = preferences.getBoolean("show_touchscreen_controls_enabled", false); // default is false (hidden)
+        boolean isShowTouchscreenControls = getScopedBoolean(PREF_SHOW_TOUCHSCREEN_CONTROLS, true);
+        if (shortcut != null) {
+            String shortcutShowTouchscreenControls = shortcut.getExtra("showTouchscreenControls");
+            if (!shortcutShowTouchscreenControls.isEmpty()) {
+                isShowTouchscreenControls = parseBoolean(shortcutShowTouchscreenControls);
+            }
+        }
         inputControlsView.setShowTouchscreenControls(isShowTouchscreenControls);
+        putScopedBoolean(PREF_SHOW_TOUCHSCREEN_CONTROLS, isShowTouchscreenControls);
 
         boolean isTimeoutEnabled = preferences.getBoolean("touchscreen_timeout_enabled", false);
         boolean isHapticsEnabled = preferences.getBoolean("touchscreen_haptics_enabled", false);
@@ -1429,15 +1503,26 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
         editor.putBoolean("touchscreen_haptics_enabled", isHapticsEnabled);
         editor.apply();
 
-        // If no profile is selected, hide the controls
-        int selectedProfileIndex = preferences.getInt("selected_profile_index", -1); // Default to -1 for no profile
+        int selectedProfileId = getScopedInt(PREF_SELECTED_PROFILE_ID, 0);
+        if (shortcut != null) {
+            String controlsProfile = shortcut.getExtra("controlsProfile");
+            if (!controlsProfile.isEmpty()) {
+                try {
+                    selectedProfileId = Integer.parseInt(controlsProfile);
+                } catch (NumberFormatException ignored) {
+                    selectedProfileId = 0;
+                }
+            }
+        }
 
-        if (selectedProfileIndex >= 0 && selectedProfileIndex < inputControlsManager.getProfiles().size()) {
-            // A profile is selected, show the controls
-            ControlsProfile profile = inputControlsManager.getProfiles().get(selectedProfileIndex);
-            showInputControls(profile);
+        if (selectedProfileId > 0) {
+            ControlsProfile profile = inputControlsManager.getProfile(selectedProfileId);
+            if (profile != null) {
+                showInputControls(profile);
+            } else {
+                hideInputControls();
+            }
         } else {
-            // No profile selected, ensure the controls are hidden
             hideInputControls();
         }
 
@@ -1494,6 +1579,9 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
         inputControlsView.setVisibility(View.VISIBLE);
         inputControlsView.requestFocus();
         inputControlsView.setProfile(profile);
+        if (profile != null) {
+            putScopedInt(PREF_SELECTED_PROFILE_ID, profile.id);
+        }
 
         touchpadView.setSensitivity(profile.getCursorSpeed() * globalCursorSpeed);
         touchpadView.setPointerButtonRightEnabled(false);
@@ -1503,9 +1591,9 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
     }
 
     private void hideInputControls() {
-        inputControlsView.setShowTouchscreenControls(true);
         inputControlsView.setVisibility(View.GONE);
         inputControlsView.setProfile(null);
+        putScopedInt(PREF_SELECTED_PROFILE_ID, 0);
 
         touchpadView.setSensitivity(globalCursorSpeed);
         touchpadView.setPointerButtonLeftEnabled(true);
